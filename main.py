@@ -14,13 +14,13 @@ from telegram.ext import (
 )
 from playwright.async_api import async_playwright
 
-# --- Dummy HTTP Server for Render Free Web Service ---
+# --- Dummy Server for Render Free Service ---
 class DummyServer(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.send_header("Content-type", "text/html")
         self.end_headers()
-        self.wfile.write(b"IRCTC Chart Bot Active!")
+        self.wfile.write(b"Bot is active!")
 
     def do_HEAD(self):
         self.send_response(200)
@@ -30,7 +30,7 @@ class DummyServer(BaseHTTPRequestHandler):
 def start_dummy_server():
     port = int(os.environ.get("PORT", 10000))
     server = HTTPServer(('0.0.0.0', port), DummyServer)
-    print(f"🌐 Dummy Server active on port {port}")
+    print(f"🌐 Server running on port {port}")
     server.serve_forever()
 
 threading.Thread(target=start_dummy_server, daemon=True).start()
@@ -45,7 +45,6 @@ ensure_playwright_browsers()
 TRAIN_NO, DATE, STATION, COACH_INPUT = range(4)
 user_data_store = {}
 
-# --- Commands & Handlers ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👋 IRCTC Reservation Chart Bot में आपका स्वागत है!\n\n"
@@ -68,24 +67,22 @@ async def receive_station(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_data_store[chat_id]['station'] = update.message.text.strip().upper()
 
     await update.message.reply_text(
-        "🚃 किस Coach की खाली सीटें देखना चाहते हैं?\n\n"
-        "उदाहरण: D9, D8, B1, C1 या सब देखने के लिए ALL लिखें:"
+        "🚃 किस Coach की सीटें देखना चाहते हैं?\n"
+        "उदा. D9, D8, B1, C1 या सभी के लिए ALL लिखें:"
     )
     return COACH_INPUT
 
-# --- Scraping Core Logic ---
+# --- Accurate Autocomplete Handled Scraping ---
 async def fetch_chart_data(train_no: str, date: str, station: str, coach_input: str):
     async with async_playwright() as p:
         try:
-            # Fixing ERR_HTTP2_PROTOCOL_ERROR using anti-bot flags & disabling HTTP2
             browser = await p.chromium.launch(
                 headless=True,
                 args=[
                     "--no-sandbox",
                     "--disable-setuid-sandbox",
                     "--disable-dev-shm-usage",
-                    "--disable-http2",  # Prevents ERR_HTTP2_PROTOCOL_ERROR
-                    "--ignore-certificate-errors",
+                    "--disable-http2",
                 ]
             )
             context = await browser.new_context(
@@ -94,29 +91,43 @@ async def fetch_chart_data(train_no: str, date: str, station: str, coach_input: 
             )
             page = await context.new_page()
 
-            # PAGE 1: Open Form Page
-            await page.goto("https://www.irctc.co.in/online-charts/", timeout=60000, wait_until="domcontentloaded")
+            # Open IRCTC Page
+            await page.goto("https://www.irctc.co.in/online-charts/", timeout=40000, wait_until="domcontentloaded")
             await page.wait_for_timeout(2000)
 
-            # Fill Train Number
+            # 1. Fill Train Number and Click Dropdown Pop-up
             train_input = page.locator("input[placeholder*='Train']")
             await train_input.fill(train_no)
-            await page.wait_for_timeout(1000)
-            await page.keyboard.press("Enter")
+            await page.wait_for_timeout(1500)
+            
+            # Autocomplete Option Click (e.g. "22188 - INTERCITY EXP")
+            await page.locator("mat-option, .mat-autocomplete-panel option, div[role='option']").first.click()
             await page.wait_for_timeout(1000)
 
-            # Submit Form
-            await page.click("button:has-text('GET TRAIN CHART')")
+            # 2. Fill Boarding Station and Click Dropdown Pop-up
+            stn_input = page.locator("input[placeholder*='Boarding'], input[placeholder*='Station']")
+            if await stn_input.count() > 0:
+                await stn_input.fill(station)
+                await page.wait_for_timeout(1500)
+                # Autocomplete Option Click (e.g. "MADAN MAHAL (MML)")
+                await page.locator("mat-option, .mat-autocomplete-panel option, div[role='option']").first.click()
+                await page.wait_for_timeout(1000)
+
+            # 3. Click GET TRAIN CHART Button
+            get_chart_btn = page.locator("button:has-text('GET TRAIN CHART')")
+            await get_chart_btn.click()
             await page.wait_for_timeout(4000)
 
-            # PAGE 2: Click Class Button (e.g. SECOND SITTING, THIRD AC)
-            class_buttons = await page.query_selector_all("button.mat-raised-button, button.btn")
-            if class_buttons:
-                # Click first available class button
-                await class_buttons[0].click()
-                await page.wait_for_timeout(4000)
+            # 4. Click First Class Button (Page 2)
+            class_buttons = await page.query_selector_all("button")
+            for btn in class_buttons:
+                txt = await btn.inner_text()
+                if any(c in txt for c in ["SITTING", "AC", "CHAIR", "SLEEPER", "2S", "3A", "CC"]):
+                    await btn.click()
+                    await page.wait_for_timeout(4000)
+                    break
 
-            # PAGE 3: Extract Table Data (From | To | Coach | Berth No)
+            # 5. Extract Vacant Berth Table (Page 3)
             rows = await page.query_selector_all("tr")
             target_coach = coach_input.strip().upper()
             vacant_seats = []
@@ -129,33 +140,32 @@ async def fetch_chart_data(train_no: str, date: str, station: str, coach_input: 
                     coach = (await cols[2].inner_text()).strip()
                     berth = (await cols[3].inner_text()).strip()
 
-                    # Apply Coach Filter
                     if target_coach != "ALL" and target_coach != coach.upper():
                         continue
 
-                    vacant_seats.append(f"From: {from_stn} ➔ To: {to_stn} | Coach: {coach} | Berth: {berth}")
+                    vacant_seats.append(f"From: {from_stn} ➔ To: {to_stn} | Coach: {coach} | Berth No: {berth}")
 
             await browser.close()
 
-            # Formatting Results
+            # Format Response
             res = f"🚆 RESERVATION CHART STATUS 🚆\n"
             res += f"Train: {train_no} | Date: {date} | Station: {station}\n"
             res += f"Filter Coach: {target_coach}\n"
             res += "───────────────────────────\n\n"
 
             if vacant_seats:
-                res += "💺 Vacant Berth Details:\n\n"
-                for idx, seat in enumerate(vacant_seats[:30], 1):  # Top 30 seats
+                res += "💺 Vacant Berth Details (Seat Number Wise):\n\n"
+                for idx, seat in enumerate(vacant_seats[:35], 1):
                     res += f"{idx}. 📌 {seat}\n"
             else:
-                res += f"⚠️ Coach '{target_coach}' में कोई खाली सीट नहीं मिली या चार्ट अभी तैयार नहीं हुआ है।"
+                res += f"⚠️ Coach '{target_coach}' में कोई खाली सीट नहीं मिली या डेटा लोड नहीं हो पाया।"
 
             return res
 
         except Exception as e:
             return f"❌ Error: {str(e)}"
 
-# --- Final Process ---
+# --- Step 5: Process Coach and Send Result ---
 async def receive_coach_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.message.chat_id
     coach_choice = update.message.text.strip()
@@ -164,7 +174,7 @@ async def receive_coach_input(update: Update, context: ContextTypes.DEFAULT_TYPE
     t_info = user_data_store[chat_id]
     
     status_msg = await update.message.reply_text(
-        f"⏳ IRCTC Chart से Coach '{coach_choice.upper()}' की सीटें निकाली जा रही हैं...\nकृपया 5-10 सेकंड प्रतीक्षा करें..."
+        f"⏳ IRCTC Chart से Coach '{coach_choice.upper()}' का डेटा निकाला जा रहा है...\nकृपया 5-8 सेकंड प्रतीक्षा करें..."
     )
 
     result = await fetch_chart_data(t_info['train_no'], t_info['date'], t_info['station'], coach_choice)
@@ -192,7 +202,7 @@ def main():
     )
 
     app.add_handler(conv_handler)
-    print("🤖 Bot Active...")
+    print("🤖 Bot Active with AutoComplete Fix...")
     app.run_polling()
 
 if __name__ == "__main__":
