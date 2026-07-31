@@ -159,17 +159,20 @@ async def serve_gui():
             
             <div class="bg-blue-600 p-5 text-center text-white">
                 <h1 class="text-2xl font-extrabold tracking-wide">Reservation Chart</h1>
-                <p class="text-blue-100 text-sm mt-1">Advanced Bypass API System</p>
+                <p class="text-blue-100 text-sm mt-1">Advanced Auto-Fetch System</p>
             </div>
 
             <div class="p-6 space-y-5">
-                <!-- Train Input -->
-                <div>
-                    <label class="block text-sm font-semibold text-gray-700 mb-1">Train Number</label>
-                    <input type="text" id="train_no" placeholder="e.g. 12191" class="w-full px-4 py-2 bg-gray-50 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:outline-none transition">
-                    <div id="train_info_box" class="hidden mt-2 text-sm bg-green-50 text-green-700 px-3 py-2 rounded-lg border border-green-200">
-                        <span id="train_name_lbl" class="font-bold"></span>
-                        <div id="train_days_lbl" class="mt-1 tracking-widest font-mono text-xs text-gray-600"></div>
+                <!-- Train Input with Autocomplete -->
+                <div class="relative">
+                    <label class="block text-sm font-semibold text-gray-700 mb-1">Train Number / Name</label>
+                    <input type="text" id="train_no" placeholder="e.g. 12191" maxlength="5" class="w-full px-4 py-2 bg-gray-50 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:outline-none transition">
+                    
+                    <!-- Smart Suggestion Box (Hidden by default) -->
+                    <div id="autocomplete_box" class="hidden absolute z-10 w-full mt-1 bg-white border border-gray-200 rounded-md shadow-lg overflow-hidden">
+                        <div id="train_suggestion" class="px-4 py-3 cursor-pointer hover:bg-blue-50 font-medium text-gray-800 flex items-center gap-2">
+                            <span>🚆</span> <span id="suggestion_text"></span>
+                        </div>
                     </div>
                 </div>
 
@@ -183,7 +186,7 @@ async def serve_gui():
                 <div>
                     <label class="block text-sm font-semibold text-gray-700 mb-1">Boarding Station</label>
                     <select id="station" class="w-full px-4 py-2 bg-gray-50 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:outline-none disabled:bg-gray-200">
-                        <option value="">Enter Train Number first...</option>
+                        <option value="">Select train first</option>
                     </select>
                 </div>
 
@@ -194,7 +197,7 @@ async def serve_gui():
                 </div>
                 
                 <button id="submitBtn" class="w-full bg-blue-600 hover:bg-blue-700 text-white font-bold py-3 px-4 rounded-lg shadow transition flex justify-center items-center gap-2">
-                    <span>Check Chart</span>
+                    <span>Check Chart 🔍</span>
                     <div id="mainLoader" class="loader !border-white !border-t-blue-600"></div>
                 </button>
             </div>
@@ -204,17 +207,29 @@ async def serve_gui():
         </div>
 
         <script>
-            // Auto-set today's date
             document.getElementById('date').valueAsDate = new Date();
 
-            // Train validation & Station fetching
             const trainInput = document.getElementById('train_no');
             const stationSelect = document.getElementById('station');
-            const trainInfoBox = document.getElementById('train_info_box');
+            const autocompleteBox = document.getElementById('autocomplete_box');
+            const suggestionText = document.getElementById('suggestion_text');
             
-            trainInput.addEventListener('blur', async () => {
-                const trNo = trainInput.value.trim();
-                if(trNo.length >= 4) {
+            // Listen for typing instantly (no need to click outside)
+            trainInput.addEventListener('input', async (e) => {
+                const trNo = e.target.value.trim();
+                
+                // Hide box if input is cleared
+                if(trNo.length < 5) {
+                    autocompleteBox.classList.add('hidden');
+                    stationSelect.innerHTML = '<option value="">Select train first</option>';
+                    stationSelect.disabled = true;
+                    return;
+                }
+
+                // Exactly 5 digits entered, fetch automatically
+                if(trNo.length === 5) {
+                    suggestionText.innerText = "Searching train details...";
+                    autocompleteBox.classList.remove('hidden');
                     stationSelect.innerHTML = '<option>Loading stations...</option>';
                     stationSelect.disabled = true;
                     
@@ -223,11 +238,9 @@ async def serve_gui():
                         const data = await res.json();
                         
                         if(data.trainName) {
-                            // Show Train Info
-                            trainInfoBox.classList.remove('hidden');
-                            document.getElementById('train_name_lbl').innerText = trNo + ' - ' + data.trainName;
-                            document.getElementById('train_days_lbl').innerText = "Runs On: " + data.runsOn.join(' ');
-
+                            // Populate Autocomplete Box
+                            suggestionText.innerText = `${trNo} - ${data.trainName}`;
+                            
                             // Populate Dropdown
                             stationSelect.innerHTML = '';
                             data.stations.forEach(stn => {
@@ -238,17 +251,22 @@ async def serve_gui():
                             });
                             stationSelect.disabled = false;
                         } else {
+                            suggestionText.innerText = "Invalid Train Number";
                             stationSelect.innerHTML = '<option value="">Invalid Train Number</option>';
-                            trainInfoBox.classList.add('hidden');
                         }
-                    } catch(e) {
+                    } catch(err) {
+                        suggestionText.innerText = "Network Error";
                         stationSelect.innerHTML = '<option value="">Network Error</option>';
-                        trainInfoBox.classList.add('hidden');
                     }
                 }
             });
 
-            // Submit Form
+            // Hide autocomplete when clicked
+            document.getElementById('train_suggestion').addEventListener('click', () => {
+                autocompleteBox.classList.add('hidden');
+            });
+
+            // Submit Form Logic
             document.getElementById('submitBtn').addEventListener('click', async () => {
                 const trNo = trainInput.value;
                 const dt = document.getElementById('date').value;
