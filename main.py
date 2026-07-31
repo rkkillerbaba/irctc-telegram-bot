@@ -1,5 +1,6 @@
 import os
 import asyncio
+import sys
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import threading
 from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove
@@ -21,14 +22,25 @@ class DummyServer(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(b"Bot is active and running!")
 
+    def do_HEAD(self):
+        self.send_response(200)
+        self.send_header("Content-type", "text/html")
+        self.end_headers()
+
 def start_dummy_server():
     port = int(os.environ.get("PORT", 10000))
     server = HTTPServer(('0.0.0.0', port), DummyServer)
     print(f"🌐 Dummy Web Server listening on port {port}")
     server.serve_forever()
 
-# Background में Dummy Server चालू करें
 threading.Thread(target=start_dummy_server, daemon=True).start()
+
+# --- Auto Install Chromium Check ---
+def ensure_playwright_browsers():
+    print("⏳ Checking/Installing Playwright Chromium...")
+    os.system("playwright install chromium")
+
+ensure_playwright_browsers()
 
 # --- Telegram Bot Logic ---
 TRAIN_NO, DATE, STATION, COACH_CHOICE = range(4)
@@ -66,13 +78,17 @@ async def receive_station(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def fetch_chart_data(train_no: str, date: str, station: str, coach_choice: str):
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
-        context = await browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-        )
-        page = await context.new_page()
-        
         try:
+            # Launch Chromium with extra flags for Render environment
+            browser = await p.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"]
+            )
+            context = await browser.new_context(
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            )
+            page = await context.new_page()
+
             await page.goto("https://www.irctc.co.in/online-charts/", timeout=60000)
             await page.wait_for_load_state("networkidle")
 
@@ -106,7 +122,6 @@ async def fetch_chart_data(train_no: str, date: str, station: str, coach_choice:
                 return f"⚠️ Train {train_no} ({coach_choice}) के लिए कोई खाली सीट नहीं मिली।"
 
         except Exception as e:
-            await browser.close()
             return f"❌ त्रुटि: {str(e)}"
 
 async def receive_coach(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -145,7 +160,7 @@ def main():
     )
 
     app.add_handler(conv_handler)
-    print("🤖 Bot Active with Free Web Service Port Binding...")
+    print("🤖 Bot Active...")
     app.run_polling()
 
 if __name__ == "__main__":
