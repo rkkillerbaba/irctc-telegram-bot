@@ -2,7 +2,7 @@ import os
 import asyncio
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import threading
-from curl_cffi import requests
+import httpx
 from telegram import Update
 from telegram.ext import (
     ApplicationBuilder,
@@ -35,15 +35,17 @@ threading.Thread(target=start_dummy_server, daemon=True).start()
 TRAIN_NO, DATE, STATION, COACH_INPUT = range(4)
 user_data_store = {}
 
-# 🔥 HACK: Using reservationchart.online as Origin to bypass IRCTC HTTP/2 Block
+# 🔥 Exact headers from your screenshot (No cookies needed!)
 HEADERS = {
-    "Accept": "application/json, text/plain, */*",
-    "Accept-Language": "en-US,en;q=0.9",
+    "Host": "www.irctc.co.in",
+    "Accept": "*/*",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Accept-Language": "en-IN,en-GB;q=0.9,en-US;q=0.8,en;q=0.7",
+    "Bmirak": "webbm",
     "Content-Type": "application/json",
     "Origin": "https://reservationchart.online",
     "Referer": "https://reservationchart.online/",
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "bmirak": "webbm"
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 }
 
 # --- Handlers ---
@@ -88,16 +90,10 @@ def parse_coach_json(json_data):
     return vacant_list
 
 async def fetch_chart_api(train_no, date, station, coach_input):
-    # 'chrome116' impersonation with increased timeout
-    async with requests.AsyncSession(impersonate="chrome116", timeout=30.0) as client:
+    # http2=False forces HTTP/1.1 to bypass the HTTP/2 stream error
+    async with httpx.AsyncClient(http2=False, verify=False, timeout=30.0) as client:
         try:
-            # 1. Warm-up request to get tracking cookies
-            try:
-                await client.get("https://reservationchart.online/", headers=HEADERS, timeout=10.0)
-            except:
-                pass 
-            
-            # 2. Fetch Train Composition (Summary)
+            # Directly hitting the API (No warm-up / no cookies!)
             comp_url = "https://www.irctc.co.in/online-charts/api/trainComposition"
             payload = {
                 "trainNo": train_no,
@@ -131,7 +127,6 @@ async def fetch_chart_api(train_no, date, station, coach_input):
             else:
                 coaches_to_fetch = [target_coach]
 
-            # 3. Fetch Coach Specific Vacant Berths
             coach_url = "https://www.irctc.co.in/online-charts/api/coachComposition"
             
             for c_name in coaches_to_fetch:
@@ -157,8 +152,10 @@ async def fetch_chart_api(train_no, date, station, coach_input):
 
             return res
 
+        except httpx.ReadTimeout:
+            return "❌ Timeout Error: IRCTC सर्वर धीमा चल रहा है। कृपया कुछ देर बाद प्रयास करें।"
         except Exception as e:
-            return f"❌ Connection Error (Bypass Failed): {str(e)}"
+            return f"❌ Connection Error: {str(e)}"
 
 async def receive_coach_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.message.chat_id
@@ -192,7 +189,7 @@ def main():
     )
 
     app.add_handler(conv_handler)
-    print("🚀 Bot Active - ReservationChart Bypass Mode!")
+    print("🚀 Bot Active - HTTP/1.1 No-Cookie API Bypass!")
     
     app.run_polling(drop_pending_updates=True)
 
