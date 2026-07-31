@@ -14,8 +14,8 @@ class ChartRequest(BaseModel):
     station: str
     coach: str
 
-# --- IRCTC Headers (Bypass) ---
-HEADERS = {
+# --- Headers for Chart API (Browser Impersonation) ---
+CHART_HEADERS = {
     "Host": "www.irctc.co.in",
     "Accept": "*/*",
     "Accept-Encoding": "gzip, deflate, br",
@@ -27,33 +27,32 @@ HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 }
 
-# --- 1. Train Schedule API (For Name & Stations Dropdown) ---
+# --- Headers for Train Info API (Mobile App Impersonation Bypass) ---
+INFO_HEADERS = {
+    "User-Agent": "Dalvik/2.1.0 (Linux; U; Android 12; Pixel 6 Build/SQ3A.220705.004)",
+    "Accept-Encoding": "gzip",
+    "Connection": "Keep-Alive"
+}
+
+# --- 1. Train Schedule API (Auto-fetch) ---
 @app.get("/api/train_info/{train_no}")
 async def get_train_info(train_no: str):
     url = f"https://www.irctc.co.in/eticketing/protected/mapps1/trnscheduleenquiry/{train_no}"
-    async with httpx.AsyncClient(http2=False, verify=False, timeout=15.0) as client:
+    async with httpx.AsyncClient(http2=False, verify=False, timeout=10.0) as client:
         try:
-            resp = await client.get(url, headers=HEADERS)
+            resp = await client.get(url, headers=INFO_HEADERS)
             if resp.status_code == 200:
                 data = resp.json()
-                return {
-                    "trainName": data.get("trainName", "Unknown Train"),
-                    "stations": [{"code": stn["stationCode"], "name": stn["stationName"]} for stn in data.get("stationList", [])],
-                    "runsOn": [
-                        "M" if data.get("trainRunsOnMon") == "Y" else "-",
-                        "T" if data.get("trainRunsOnTue") == "Y" else "-",
-                        "W" if data.get("trainRunsOnWed") == "Y" else "-",
-                        "T" if data.get("trainRunsOnThu") == "Y" else "-",
-                        "F" if data.get("trainRunsOnFri") == "Y" else "-",
-                        "S" if data.get("trainRunsOnSat") == "Y" else "-",
-                        "S" if data.get("trainRunsOnSun") == "Y" else "-"
-                    ]
-                }
-            return {"error": "Train not found"}
+                if "trainName" in data:
+                    return {
+                        "trainName": data.get("trainName", "Unknown Train"),
+                        "stations": [{"code": stn["stationCode"], "name": stn["stationName"]} for stn in data.get("stationList", [])]
+                    }
+            return {"error": "Train not found or API blocked"}
         except Exception as e:
             return {"error": str(e)}
 
-# --- 2. Parse Coach JSON (Extracting Vacant Seats) ---
+# --- 2. Parse Coach JSON ---
 def parse_coach_json(json_data):
     berth_type_map = {'L': 'Lower', 'M': 'Middle', 'U': 'Upper', 'R': 'Side Lower', 'P': 'Side Upper', 'SL': 'Side Lower', 'SU': 'Side Upper'}
     vacant_list = []
@@ -66,7 +65,7 @@ def parse_coach_json(json_data):
         berth_code = berth_type_map.get(berth.get('berthCode'), berth.get('berthCode'))
         
         for seg in berth.get('bsd', []):
-            if not seg.get('occupancy'): # False means Vacant!
+            if not seg.get('occupancy'): 
                 from_stn = seg.get('from')
                 to_stn = seg.get('to')
                 quota = seg.get('quota', 'GN')
@@ -78,13 +77,12 @@ def parse_coach_json(json_data):
 async def fetch_chart_api(train_no, date, station, coach_input):
     async with httpx.AsyncClient(http2=False, verify=False, timeout=30.0) as client:
         try:
-            # Get Summary
             comp_url = "https://www.irctc.co.in/online-charts/api/trainComposition"
             payload = {"trainNo": train_no, "jDate": date, "boardStn": station}
             
-            resp = await client.post(comp_url, json=payload, headers=HEADERS)
+            resp = await client.post(comp_url, json=payload, headers=CHART_HEADERS)
             if resp.status_code != 200:
-                return f"<div class='text-red-500 font-bold'>❌ IRCTC Error ({resp.status_code}): चार्ट अभी तैयार नहीं हुआ है।</div>"
+                return f"<div class='text-red-500 font-bold'>❌ IRCTC Error ({resp.status_code}): चार्ट अभी तैयार नहीं हुआ है या स्टेशन कोड गलत है।</div>"
 
             comp_data = resp.json()
             coaches = comp_data.get("cdd", [])
@@ -109,11 +107,10 @@ async def fetch_chart_api(train_no, date, station, coach_input):
             else:
                 coaches_to_fetch = [target_coach]
 
-            # Get Specific Coach Details
             coach_url = "https://www.irctc.co.in/online-charts/api/coachComposition"
             for c_name in coaches_to_fetch:
                 coach_payload = {"trainNo": train_no, "jDate": date, "boardStn": station, "coachName": c_name}
-                coach_resp = await client.post(coach_url, json=coach_payload, headers=HEADERS)
+                coach_resp = await client.post(coach_url, json=coach_payload, headers=CHART_HEADERS)
                 
                 if coach_resp.status_code == 200:
                     coach_json = coach_resp.json()
@@ -163,15 +160,14 @@ async def serve_gui():
             </div>
 
             <div class="p-6 space-y-5">
-                <!-- Train Input with Autocomplete -->
+                <!-- Train Input -->
                 <div class="relative">
                     <label class="block text-sm font-semibold text-gray-700 mb-1">Train Number / Name</label>
-                    <input type="text" id="train_no" placeholder="e.g. 12191" maxlength="5" class="w-full px-4 py-2 bg-gray-50 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:outline-none transition">
+                    <input type="text" id="train_no" placeholder="e.g. 22188" maxlength="5" class="w-full px-4 py-2 bg-gray-50 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:outline-none transition">
                     
-                    <!-- Smart Suggestion Box (Hidden by default) -->
                     <div id="autocomplete_box" class="hidden absolute z-10 w-full mt-1 bg-white border border-gray-200 rounded-md shadow-lg overflow-hidden">
-                        <div id="train_suggestion" class="px-4 py-3 cursor-pointer hover:bg-blue-50 font-medium text-gray-800 flex items-center gap-2">
-                            <span>🚆</span> <span id="suggestion_text"></span>
+                        <div id="train_suggestion" class="px-4 py-3 cursor-pointer hover:bg-blue-50 font-medium text-gray-800 flex flex-col gap-1">
+                            <span id="suggestion_text" class="flex items-center gap-2"></span>
                         </div>
                     </div>
                 </div>
@@ -182,12 +178,11 @@ async def serve_gui():
                     <input type="date" id="date" class="w-full px-4 py-2 bg-gray-50 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:outline-none">
                 </div>
 
-                <!-- Dynamic Station Dropdown -->
+                <!-- Fallback Combo Box (Datalist) -->
                 <div>
                     <label class="block text-sm font-semibold text-gray-700 mb-1">Boarding Station</label>
-                    <select id="station" class="w-full px-4 py-2 bg-gray-50 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:outline-none disabled:bg-gray-200">
-                        <option value="">Select train first</option>
-                    </select>
+                    <input type="text" id="station" list="station_list" placeholder="e.g. MML, JBP" required class="w-full px-4 py-2 bg-gray-50 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 uppercase focus:outline-none transition">
+                    <datalist id="station_list"></datalist>
                 </div>
 
                 <!-- Coach Input -->
@@ -210,67 +205,58 @@ async def serve_gui():
             document.getElementById('date').valueAsDate = new Date();
 
             const trainInput = document.getElementById('train_no');
-            const stationSelect = document.getElementById('station');
+            const stationInput = document.getElementById('station');
+            const stationList = document.getElementById('station_list');
             const autocompleteBox = document.getElementById('autocomplete_box');
             const suggestionText = document.getElementById('suggestion_text');
             
-            // Listen for typing instantly (no need to click outside)
             trainInput.addEventListener('input', async (e) => {
                 const trNo = e.target.value.trim();
                 
-                // Hide box if input is cleared
                 if(trNo.length < 5) {
                     autocompleteBox.classList.add('hidden');
-                    stationSelect.innerHTML = '<option value="">Select train first</option>';
-                    stationSelect.disabled = true;
                     return;
                 }
 
-                // Exactly 5 digits entered, fetch automatically
                 if(trNo.length === 5) {
-                    suggestionText.innerText = "Searching train details...";
+                    suggestionText.innerHTML = "<span>⏳</span> Searching details...";
                     autocompleteBox.classList.remove('hidden');
-                    stationSelect.innerHTML = '<option>Loading stations...</option>';
-                    stationSelect.disabled = true;
                     
                     try {
                         const res = await fetch(`/api/train_info/${trNo}`);
                         const data = await res.json();
                         
                         if(data.trainName) {
-                            // Populate Autocomplete Box
-                            suggestionText.innerText = `${trNo} - ${data.trainName}`;
+                            suggestionText.innerHTML = `<span>🚆</span> <span>${trNo} - ${data.trainName}</span>`;
                             
-                            // Populate Dropdown
-                            stationSelect.innerHTML = '';
+                            // Populate Combo Box
+                            stationList.innerHTML = '';
                             data.stations.forEach(stn => {
                                 const opt = document.createElement('option');
                                 opt.value = stn.code;
-                                opt.innerText = `${stn.code} - ${stn.name}`;
-                                stationSelect.appendChild(opt);
+                                opt.innerText = stn.name;
+                                stationList.appendChild(opt);
                             });
-                            stationSelect.disabled = false;
+                            stationInput.placeholder = "Select or type (e.g. " + data.stations[0].code + ")";
                         } else {
-                            suggestionText.innerText = "Invalid Train Number";
-                            stationSelect.innerHTML = '<option value="">Invalid Train Number</option>';
+                            // If IRCTC blocked it, don't lock the UI!
+                            suggestionText.innerHTML = "<span>⚠️</span> <span class='text-sm text-red-600'>Auto-fetch blocked by IRCTC. Please type station code manually below.</span>";
+                            stationInput.placeholder = "e.g. MML, JBP";
                         }
                     } catch(err) {
-                        suggestionText.innerText = "Network Error";
-                        stationSelect.innerHTML = '<option value="">Network Error</option>';
+                        suggestionText.innerHTML = "<span>⚠️</span> <span class='text-sm text-red-600'>Network Error. Please type station code manually below.</span>";
                     }
                 }
             });
 
-            // Hide autocomplete when clicked
             document.getElementById('train_suggestion').addEventListener('click', () => {
                 autocompleteBox.classList.add('hidden');
             });
 
-            // Submit Form Logic
             document.getElementById('submitBtn').addEventListener('click', async () => {
                 const trNo = trainInput.value;
                 const dt = document.getElementById('date').value;
-                const stn = stationSelect.value;
+                const stn = stationInput.value;
                 let ch = document.getElementById('coach').value || "ALL";
 
                 if(!trNo || !dt || !stn) {
