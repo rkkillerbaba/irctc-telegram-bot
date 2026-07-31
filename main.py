@@ -3,7 +3,7 @@ import asyncio
 import sys
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import threading
-from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove
+from telegram import Update, ReplyKeyboardRemove
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
@@ -20,7 +20,7 @@ class DummyServer(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-type", "text/html")
         self.end_headers()
-        self.wfile.write(b"Bot is active and running!")
+        self.wfile.write(b"IRCTC Chart Bot is Active!")
 
     def do_HEAD(self):
         self.send_response(200)
@@ -35,51 +35,52 @@ def start_dummy_server():
 
 threading.Thread(target=start_dummy_server, daemon=True).start()
 
-# --- Auto Install Chromium Check ---
+# --- Auto Install Chromium ---
 def ensure_playwright_browsers():
     print("⏳ Checking/Installing Playwright Chromium...")
     os.system("playwright install chromium")
 
 ensure_playwright_browsers()
 
-# --- Telegram Bot Logic ---
-TRAIN_NO, DATE, STATION, COACH_CHOICE = range(4)
+# --- Telegram Bot States ---
+TRAIN_NO, DATE, STATION, COACH_INPUT = range(4)
 user_data_store = {}
 
+# --- Step 1: Start Command ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "👋 **IRCTC Chart Search Bot** में आपका स्वागत है!\n\n"
-        "कृपया **Train Number** दर्ज करें (उदा. `12952`):"
+        "👋 IRCTC Chart Search Bot में आपका स्वागत है!\n\n"
+        "कृपया Train Number दर्ज करें (उदा. 22188):"
     )
     return TRAIN_NO
 
+# --- Step 2: Receive Train Number ---
 async def receive_train_no(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_data_store[update.message.chat_id] = {'train_no': update.message.text.strip()}
-    await update.message.reply_text("🗓️ अब **Journey Date** दर्ज करें (Format: `YYYY-MM-DD`, उदा. `2026-08-05`):")
+    await update.message.reply_text("🗓️ अब Journey Date दर्ज करें (Format: YYYY-MM-DD, उदा. 2026-07-31):")
     return DATE
 
+# --- Step 3: Receive Date ---
 async def receive_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_data_store[update.message.chat_id]['date'] = update.message.text.strip()
-    await update.message.reply_text("🚉 अब **Boarding Station Code** दर्ज करें (उदा. `NDLS`, `MMCT`):")
+    await update.message.reply_text("🚉 अब Boarding Station Code दर्ज करें (उदा. MML, NDLS):")
     return STATION
 
+# --- Step 4: Receive Station & Ask for Specific Coach ---
 async def receive_station(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.message.chat_id
     user_data_store[chat_id]['station'] = update.message.text.strip().upper()
 
-    reply_keyboard = [["All Coaches", "S1", "S2"], ["B1", "B2", "A1"], ["H1"]]
-    markup = ReplyKeyboardMarkup(reply_keyboard, one_time_keyboard=True, resize_keyboard=True)
-
     await update.message.reply_text(
-        "🚂 आप किस **Coach** की सीटें देखना चाहते हैं? चुनें या टाइप करें (उदा. `B1` या `All`):",
-        reply_markup=markup
+        "🚃 आप कौन से Coach की खाली सीटें सीट-नंबर वाइज देखना चाहते हैं?\n\n"
+        "उदाहरण: D8, B1, S1 या सभी देखने के लिए ALL टाइप करें:"
     )
-    return COACH_CHOICE
+    return COACH_INPUT
 
-async def fetch_chart_data(train_no: str, date: str, station: str, coach_choice: str):
+# --- Web Scraping Logic ---
+async def fetch_chart_data(train_no: str, date: str, station: str, coach_input: str):
     async with async_playwright() as p:
         try:
-            # Launch Chromium with extra flags for Render environment
             browser = await p.chromium.launch(
                 headless=True,
                 args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"]
@@ -89,9 +90,11 @@ async def fetch_chart_data(train_no: str, date: str, station: str, coach_choice:
             )
             page = await context.new_page()
 
+            # 1. Goto IRCTC Chart Portal
             await page.goto("https://www.irctc.co.in/online-charts/", timeout=60000)
             await page.wait_for_load_state("networkidle")
 
+            # 2. Input Search Details
             await page.fill("input[placeholder='Enter Train Name/Number']", train_no)
             await page.wait_for_timeout(1000)
             await page.keyboard.press("Enter")
@@ -99,50 +102,79 @@ async def fetch_chart_data(train_no: str, date: str, station: str, coach_choice:
             await page.click("button:has-text('GET TRAIN CHART')")
             await page.wait_for_timeout(5000)
 
-            vacant_seats_list = []
+            # 3. Extract Available Classes Header
+            class_buttons = await page.query_selector_all("button:has-text('AC'), button:has-text('SITTING'), button:has-text('CHAIR'), button:has-text('SLEEPER')")
+            available_classes = []
+            for btn in class_buttons:
+                txt = await btn.inner_text()
+                if txt.strip() and txt.strip() not in available_classes:
+                    available_classes.append(txt.strip())
+
+            # 4. Extract Vacant Rows & Filter by Target Coach
             rows = await page.query_selector_all(".vacant-berth-row, tr")
+            target_coach = coach_input.strip().upper()
+            vacant_seats = []
             
             for row in rows:
                 text = await row.inner_text()
-                if text.strip():
-                    if coach_choice.upper() != "ALL" and coach_choice.upper() not in text.upper():
+                if text.strip() and "Vacant" in text:
+                    # Specific coach filtering (e.g. D8)
+                    if target_coach != "ALL" and target_coach not in text.upper():
                         continue
-                    vacant_seats_list.append(text.strip().replace("\n", " | "))
+                    vacant_seats.append(text.strip().replace("\n", " | "))
 
             await browser.close()
 
-            if vacant_seats_list:
-                res = f"🎫 **VACANT SEAT DETAILS ({coach_choice.upper()})** 🎫\n"
-                res += f"🚆 Train: `{train_no}` | 📅 `{date}` | 🚉 `{station}`\n"
-                res += "───────────────────────────\n\n"
-                for seat in vacant_seats_list[:20]:
-                    res += f"📌 {seat}\n"
-                return res
+            # --- Formatting Final Output ---
+            res = f"🚆 RESERVATION CHART STATUS 🚆\n"
+            res += f"Train No: {train_no} | Date: {date} | Station: {station}\n"
+            res += f"Selected Coach Filter: {target_coach}\n"
+            res += "───────────────────────────\n\n"
+
+            if available_classes:
+                res += "📊 Available Classes in Train:\n"
+                for cls in available_classes:
+                    res += f"  • {cls}\n"
+                res += "\n"
+
+            if vacant_seats:
+                res += f"💺 Vacant Seats List (Seat Number Wise):\n"
+                for idx, seat in enumerate(vacant_seats, 1):
+                    res += f"{idx}. 📌 {seat}\n"
             else:
-                return f"⚠️ Train {train_no} ({coach_choice}) के लिए कोई खाली सीट नहीं मिली।"
+                if target_coach != "ALL":
+                    res += f"⚠️ Coach '{target_coach}' में कोई खाली सीट नहीं मिली या सीट का डेटा उपलब्ध नहीं है।"
+                else:
+                    res += f"⚠️ Train {train_no} में कोई खाली सीट नहीं मिली या चार्ट अभी तैयार नहीं हुआ है।"
+
+            return res
 
         except Exception as e:
-            return f"❌ त्रुटि: {str(e)}"
+            return f"❌ Error extracting chart data: {str(e)}"
 
-async def receive_coach(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# --- Step 5: Process Coach and Send Result ---
+async def receive_coach_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.message.chat_id
     coach_choice = update.message.text.strip()
     user_data_store[chat_id]['coach'] = coach_choice
+
     t_info = user_data_store[chat_id]
     
     status_msg = await update.message.reply_text(
-        f"⏳ **Searching Chart for Coach {coach_choice}...**\nकृपया प्रतीक्षा करें...",
-        reply_markup=ReplyKeyboardRemove()
+        f"⏳ Fetching Vacant Seats for Coach '{coach_choice.upper()}' in Train {t_info['train_no']}...\nकृपया 5-10 सेकंड प्रतीक्षा करें..."
     )
 
     result = await fetch_chart_data(t_info['train_no'], t_info['date'], t_info['station'], coach_choice)
-    await status_msg.edit_text(result, parse_mode="Markdown")
+    
+    await status_msg.edit_text(result)
     return ConversationHandler.END
 
+# --- Cancel Command ---
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("❌ प्रक्रिया रद्द कर दी गई।", reply_markup=ReplyKeyboardRemove())
+    await update.message.reply_text("❌ प्रक्रिया रद्द कर दी गई।")
     return ConversationHandler.END
 
+# --- Main App ---
 def main():
     BOT_TOKEN = os.getenv("BOT_TOKEN")
 
@@ -154,13 +186,13 @@ def main():
             TRAIN_NO: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_train_no)],
             DATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_date)],
             STATION: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_station)],
-            COACH_CHOICE: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_coach)],
+            COACH_INPUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_coach_input)],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
     )
 
     app.add_handler(conv_handler)
-    print("🤖 Bot Active...")
+    print("🤖 Bot Active with Seat Number Wise Output...")
     app.run_polling()
 
 if __name__ == "__main__":
