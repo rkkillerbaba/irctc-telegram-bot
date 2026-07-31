@@ -35,13 +35,14 @@ threading.Thread(target=start_dummy_server, daemon=True).start()
 TRAIN_NO, DATE, STATION, COACH_INPUT = range(4)
 user_data_store = {}
 
-# Custom Headers (User-Agent & TLS Fingerprint will be handled automatically by curl_cffi)
+# 🔥 HACK: Using reservationchart.online as Origin to bypass IRCTC HTTP/2 Block
 HEADERS = {
     "Accept": "application/json, text/plain, */*",
-    "Accept-Language": "en-US,en;q=0.9,hi;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
     "Content-Type": "application/json",
-    "Origin": "https://www.irctc.co.in",
-    "Referer": "https://www.irctc.co.in/online-charts/",
+    "Origin": "https://reservationchart.online",
+    "Referer": "https://reservationchart.online/",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     "bmirak": "webbm"
 }
 
@@ -57,16 +58,15 @@ async def receive_train_no(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def receive_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_data_store[update.message.chat_id]['date'] = update.message.text.strip()
-    await update.message.reply_text("🚉 Boarding Station Code दर्ज करें (उदा. SRID, MML):")
+    await update.message.reply_text("🚉 Boarding Station Code दर्ज करें (उदा. SRID, MML, NZM):")
     return STATION
 
 async def receive_station(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.message.chat_id
     user_data_store[chat_id]['station'] = update.message.text.strip().upper()
-    await update.message.reply_text("🚃 किस Coach की खाली सीटें देखना चाहते हैं?\nउदा. S6, B2, D9 या ALL दर्ज करें:")
+    await update.message.reply_text("🚃 किस Coach की खाली सीटें देखना चाहते हैं?\nउदा. S6, B2, A1 या ALL दर्ज करें:")
     return COACH_INPUT
 
-# Parse Individual Coach JSON Data
 def parse_coach_json(json_data):
     berth_type_map = {'L': 'Lower', 'M': 'Middle', 'U': 'Upper', 'R': 'Side Lower', 'P': 'Side Upper', 'SL': 'Side Lower', 'SU': 'Side Upper'}
     vacant_list = []
@@ -78,7 +78,6 @@ def parse_coach_json(json_data):
         berth_no = berth.get('berthNo')
         berth_code = berth_type_map.get(berth.get('berthCode'), berth.get('berthCode'))
         
-        # Segment Analysis (False occupancy means vacant)
         for seg in berth.get('bsd', []):
             if not seg.get('occupancy'):
                 from_stn = seg.get('from')
@@ -88,18 +87,17 @@ def parse_coach_json(json_data):
 
     return vacant_list
 
-# API Request Core with Chrome Impersonation
 async def fetch_chart_api(train_no, date, station, coach_input):
-    # impersonate="chrome120" mimics a real Google Chrome browser
-    async with requests.AsyncSession(impersonate="chrome120", timeout=25.0) as client:
+    # 'chrome116' impersonation with increased timeout
+    async with requests.AsyncSession(impersonate="chrome116", timeout=30.0) as client:
         try:
-            # 1. Warm-up request to fetch necessary session cookies
+            # 1. Warm-up request to get tracking cookies
             try:
-                await client.get("https://www.irctc.co.in/online-charts/", headers=HEADERS, timeout=10.0)
-            except Exception:
+                await client.get("https://reservationchart.online/", headers=HEADERS, timeout=10.0)
+            except:
                 pass 
             
-            # 2. Fetch Train Composition
+            # 2. Fetch Train Composition (Summary)
             comp_url = "https://www.irctc.co.in/online-charts/api/trainComposition"
             payload = {
                 "trainNo": train_no,
@@ -109,7 +107,7 @@ async def fetch_chart_api(train_no, date, station, coach_input):
             
             resp = await client.post(comp_url, json=payload, headers=HEADERS)
             if resp.status_code != 200:
-                return f"❌ IRCTC Response Error ({resp.status_code}): चार्ट अभी तैयार नहीं हुआ है या डेटा उपलब्ध नहीं है।"
+                return f"❌ IRCTC Error ({resp.status_code}): चार्ट अभी तैयार नहीं हुआ है या स्टेशन कोड गलत है।"
 
             comp_data = resp.json()
             coaches = comp_data.get("cdd", [])
@@ -125,7 +123,6 @@ async def fetch_chart_api(train_no, date, station, coach_input):
                     res += f"  • {c.get('coachName')} ({c.get('classCode')}): {c.get('vacantBerths')} Vacant\n"
                 res += "\n"
 
-            # Determine coach to fetch
             coaches_to_fetch = []
             if target_coach == "ALL":
                 coaches_to_fetch = [c.get('coachName') for c in coaches if c.get('vacantBerths', 0) > 0][:3]
@@ -134,7 +131,7 @@ async def fetch_chart_api(train_no, date, station, coach_input):
             else:
                 coaches_to_fetch = [target_coach]
 
-            # 3. Fetch Specific Coach Details
+            # 3. Fetch Coach Specific Vacant Berths
             coach_url = "https://www.irctc.co.in/online-charts/api/coachComposition"
             
             for c_name in coaches_to_fetch:
@@ -161,7 +158,7 @@ async def fetch_chart_api(train_no, date, station, coach_input):
             return res
 
         except Exception as e:
-            return f"❌ Connection Error: {str(e)}"
+            return f"❌ Connection Error (Bypass Failed): {str(e)}"
 
 async def receive_coach_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.message.chat_id
@@ -169,7 +166,7 @@ async def receive_coach_input(update: Update, context: ContextTypes.DEFAULT_TYPE
     user_data_store[chat_id]['coach'] = coach_choice
     t_info = user_data_store[chat_id]
 
-    status_msg = await update.message.reply_text("⚡ IRCTC API से डेटा निकाला जा रहा है (Chrome Bypass)...")
+    status_msg = await update.message.reply_text("⚡ IRCTC API से डेटा निकाला जा रहा है...")
 
     result = await fetch_chart_api(t_info['train_no'], t_info['date'], t_info['station'], coach_choice)
     await status_msg.edit_text(result)
@@ -195,7 +192,7 @@ def main():
     )
 
     app.add_handler(conv_handler)
-    print("🚀 API Bot Active with curl_cffi Chrome Impersonation!")
+    print("🚀 Bot Active - ReservationChart Bypass Mode!")
     
     app.run_polling(drop_pending_updates=True)
 
