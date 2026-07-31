@@ -2,7 +2,7 @@ import os
 import asyncio
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import threading
-import httpx
+from curl_cffi import requests
 from telegram import Update
 from telegram.ext import (
     ApplicationBuilder,
@@ -35,26 +35,19 @@ threading.Thread(target=start_dummy_server, daemon=True).start()
 TRAIN_NO, DATE, STATION, COACH_INPUT = range(4)
 user_data_store = {}
 
-# Exact Headers required by IRCTC Charts API
+# Custom Headers (User-Agent & TLS Fingerprint will be handled automatically by curl_cffi)
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     "Accept": "application/json, text/plain, */*",
     "Accept-Language": "en-US,en;q=0.9,hi;q=0.8",
     "Content-Type": "application/json",
     "Origin": "https://www.irctc.co.in",
     "Referer": "https://www.irctc.co.in/online-charts/",
-    "bmirak": "webbm",
-    "Sec-Ch-Ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
-    "Sec-Ch-Ua-Mobile": "?0",
-    "Sec-Ch-Ua-Platform": '"Windows"',
-    "Sec-Fetch-Dest": "empty",
-    "Sec-Fetch-Mode": "cors",
-    "Sec-Fetch-Site": "same-origin"
+    "bmirak": "webbm"
 }
 
 # --- Handlers ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("👋 IRCTC Fast Chart Bot में आपका स्वागत है!\n\nTrain Number दर्ज करें (उदा. 12191):")
+    await update.message.reply_text("👋 IRCTC Superfast Chart Bot में आपका स्वागत है!\n\nTrain Number दर्ज करें (उदा. 12191):")
     return TRAIN_NO
 
 async def receive_train_no(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -64,7 +57,7 @@ async def receive_train_no(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def receive_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_data_store[update.message.chat_id]['date'] = update.message.text.strip()
-    await update.message.reply_text("🚉 Boarding Station Code दर्ज करें (उदा. SRID, ADTL, MML):")
+    await update.message.reply_text("🚉 Boarding Station Code दर्ज करें (उदा. SRID, MML):")
     return STATION
 
 async def receive_station(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -95,24 +88,16 @@ def parse_coach_json(json_data):
 
     return vacant_list
 
-# API Request Core
+# API Request Core with Chrome Impersonation
 async def fetch_chart_api(train_no, date, station, coach_input):
-    limits = httpx.Limits(max_keepalive_connections=5, max_connections=10)
-    
-    async with httpx.AsyncClient(
-        headers=HEADERS, 
-        timeout=25.0, 
-        verify=False, 
-        http2=False, 
-        limits=limits,
-        follow_redirects=True
-    ) as client:
+    # impersonate="chrome120" mimics a real Google Chrome browser
+    async with requests.AsyncSession(impersonate="chrome120", timeout=25.0) as client:
         try:
-            # 1. Establish session & cookies
+            # 1. Warm-up request to fetch necessary session cookies
             try:
-                await client.get("https://www.irctc.co.in/online-charts/", timeout=10.0)
+                await client.get("https://www.irctc.co.in/online-charts/", headers=HEADERS, timeout=10.0)
             except Exception:
-                pass # Ignore if main page warm-up takes time
+                pass 
             
             # 2. Fetch Train Composition
             comp_url = "https://www.irctc.co.in/online-charts/api/trainComposition"
@@ -122,9 +107,9 @@ async def fetch_chart_api(train_no, date, station, coach_input):
                 "boardStn": station
             }
             
-            resp = await client.post(comp_url, json=payload)
+            resp = await client.post(comp_url, json=payload, headers=HEADERS)
             if resp.status_code != 200:
-                return f"❌ IRCTC Response Error ({resp.status_code}): चार्ट अभी तैयार नहीं हुआ है या स्टेशन कोड ({station}) गलत है।"
+                return f"❌ IRCTC Response Error ({resp.status_code}): चार्ट अभी तैयार नहीं हुआ है या डेटा उपलब्ध नहीं है।"
 
             comp_data = resp.json()
             coaches = comp_data.get("cdd", [])
@@ -160,7 +145,7 @@ async def fetch_chart_api(train_no, date, station, coach_input):
                     "coachName": c_name
                 }
 
-                coach_resp = await client.post(coach_url, json=coach_payload)
+                coach_resp = await client.post(coach_url, json=coach_payload, headers=HEADERS)
                 if coach_resp.status_code == 200:
                     coach_json = coach_resp.json()
                     vacant_seats = parse_coach_json(coach_json)
@@ -175,8 +160,6 @@ async def fetch_chart_api(train_no, date, station, coach_input):
 
             return res
 
-        except httpx.ConnectTimeout:
-            return "❌ Connection Timeout: IRCTC सर्वर से कनेक्ट करने में अधिक समय लग रहा है। कृपया 1 मिनट बाद पुनः प्रयास करें।"
         except Exception as e:
             return f"❌ Connection Error: {str(e)}"
 
@@ -186,7 +169,7 @@ async def receive_coach_input(update: Update, context: ContextTypes.DEFAULT_TYPE
     user_data_store[chat_id]['coach'] = coach_choice
     t_info = user_data_store[chat_id]
 
-    status_msg = await update.message.reply_text("⚡ IRCTC API से डेटा निकाला जा रहा है...")
+    status_msg = await update.message.reply_text("⚡ IRCTC API से डेटा निकाला जा रहा है (Chrome Bypass)...")
 
     result = await fetch_chart_api(t_info['train_no'], t_info['date'], t_info['station'], coach_choice)
     await status_msg.edit_text(result)
@@ -212,7 +195,7 @@ def main():
     )
 
     app.add_handler(conv_handler)
-    print("🚀 API Bot Active!")
+    print("🚀 API Bot Active with curl_cffi Chrome Impersonation!")
     
     app.run_polling(drop_pending_updates=True)
 
