@@ -13,12 +13,12 @@ from telegram.ext import (
     filters,
 )
 
-# --- Dummy Web Server for Render ---
+# --- Dummy Web Server for Render Health Check ---
 class DummyServer(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"Bot Active")
+        self.wfile.write(b"IRCTC Bot is Active and Healthy!")
 
     def do_HEAD(self):
         self.send_response(200)
@@ -31,7 +31,7 @@ def start_dummy_server():
 
 threading.Thread(target=start_dummy_server, daemon=True).start()
 
-# --- States ---
+# --- Conversation States ---
 TRAIN_NO, DATE, STATION, COACH_INPUT = range(4)
 user_data_store = {}
 
@@ -43,6 +43,7 @@ HEADERS = {
     "Content-Type": "application/json",
     "Origin": "https://www.irctc.co.in",
     "Referer": "https://www.irctc.co.in/online-charts/",
+    "bmirak": "webbm",
     "Sec-Ch-Ua": '"Chromium";v="122", "Not(A:Brand";v="24", "Google Chrome";v="122"',
     "Sec-Ch-Ua-Mobile": "?0",
     "Sec-Ch-Ua-Platform": '"Windows"',
@@ -51,6 +52,7 @@ HEADERS = {
     "Sec-Fetch-Site": "same-origin"
 }
 
+# --- Handlers ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("👋 IRCTC Fast Chart Bot में आपका स्वागत है!\n\nTrain Number दर्ज करें (उदा. 22188):")
     return TRAIN_NO
@@ -71,7 +73,8 @@ async def receive_station(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🚃 किस Coach की खाली सीटें देखना चाहते हैं?\nउदा. B2, D9, B1 या ALL दर्ज करें:")
     return COACH_INPUT
 
-async def parse_coach_json(json_data):
+# Parse Individual Coach JSON Data
+def parse_coach_json(json_data):
     berth_type_map = {'L': 'Lower', 'M': 'Middle', 'U': 'Upper', 'R': 'Side Lower', 'P': 'Side Upper'}
     vacant_list = []
 
@@ -82,18 +85,18 @@ async def parse_coach_json(json_data):
         berth_no = berth.get('berthNo')
         berth_code = berth_type_map.get(berth.get('berthCode'), berth.get('berthCode'))
         
-        # Check segment occupancy
+        # Segment Analysis (False occupancy means vacant)
         for seg in berth.get('bsd', []):
-            if not seg.get('occupancy'):  # False means seat is VACANT!
+            if not seg.get('occupancy'):
                 from_stn = seg.get('from')
                 to_stn = seg.get('to')
                 quota = seg.get('quota', 'GN')
-                vacant_list.append(f"Berth {berth_no} ({berth_code}) | {from_stn} ➔ {to_stn} [Quota: {quota}]")
+                vacant_list.append(f"Berth {berth_no} ({berth_code}) | {from_stn} ➔ {to_stn} [{quota}]")
 
     return vacant_list
 
+# API Request Core
 async def fetch_chart_api(train_no, date, station, coach_input):
-    # Enable HTTP/1.1 and Cookie tracking
     limits = httpx.Limits(max_keepalive_connections=5, max_connections=10)
     
     async with httpx.AsyncClient(
@@ -104,10 +107,10 @@ async def fetch_chart_api(train_no, date, station, coach_input):
         limits=limits
     ) as client:
         try:
-            # 1. First visit main page to get initial cookies
+            # 1. Establish session & cookies
             await client.get("https://www.irctc.co.in/online-charts/")
             
-            # 2. Call Train Composition API
+            # 2. Fetch Train Composition
             comp_url = "https://www.irctc.co.in/online-charts/api/trainComposition"
             payload = {
                 "trainNo": train_no,
@@ -123,49 +126,54 @@ async def fetch_chart_api(train_no, date, station, coach_input):
             coaches = comp_data.get("cdd", [])
             target_coach = coach_input.strip().upper()
 
-            # Find target coach or default
-            selected_coach = target_coach
-            if target_coach == "ALL" and coaches:
-                selected_coach = coaches[0].get('coachName', 'B1')
-
-            # 3. Call Coach Details API
-            coach_url = "https://www.irctc.co.in/online-charts/api/coachComposition"
-            coach_payload = {
-                "trainNo": train_no,
-                "jDate": date,
-                "boardStn": station,
-                "coachName": selected_coach
-            }
-
-            coach_resp = await client.post(coach_url, json=coach_payload)
-            
             res = f"🚆 RESERVATION CHART STATUS 🚆\n"
             res += f"Train: {train_no} | Date: {date} | Boarding: {station}\n"
             res += "───────────────────────────\n\n"
 
             if coaches:
-                res += "📊 Coaches Overview:\n"
-                for c in coaches[:10]:
+                res += "📊 Coaches Summary:\n"
+                for c in coaches[:15]:
                     res += f"  • {c.get('coachName')} ({c.get('classCode')}): {c.get('vacantBerths')} Vacant\n"
                 res += "\n"
 
-            if coach_resp.status_code == 200:
-                coach_json = coach_resp.json()
-                vacant_seats = await parse_coach_json(coach_json)
-
-                if vacant_seats:
-                    res += f"💺 Vacant Seats in Coach {selected_coach}:\n\n"
-                    for idx, seat in enumerate(vacant_seats[:30], 1):
-                        res += f"{idx}. 📌 {seat}\n"
-                else:
-                    res += f"⚠️ Coach {selected_coach} में कोई खाली सीट नहीं मिली।"
+            # Determine coach to fetch
+            coaches_to_fetch = []
+            if target_coach == "ALL":
+                # Take top coaches having vacant berths
+                coaches_to_fetch = [c.get('coachName') for c in coaches if c.get('vacantBerths', 0) > 0][:3]
+                if not coaches_to_fetch and coaches:
+                    coaches_to_fetch = [coaches[0].get('coachName')]
             else:
-                res += f"⚠️ Coach {selected_coach} का डेटा फ़ेच नहीं हो सका।"
+                coaches_to_fetch = [target_coach]
+
+            # 3. Fetch Specific Coach Details
+            coach_url = "https://www.irctc.co.in/online-charts/api/coachComposition"
+            
+            for c_name in coaches_to_fetch:
+                coach_payload = {
+                    "trainNo": train_no,
+                    "jDate": date,
+                    "boardStn": station,
+                    "coachName": c_name
+                }
+
+                coach_resp = await client.post(coach_url, json=coach_payload)
+                if coach_resp.status_code == 200:
+                    coach_json = coach_resp.json()
+                    vacant_seats = parse_coach_json(coach_json)
+
+                    if vacant_seats:
+                        res += f"💺 Vacant Seats in Coach {c_name}:\n"
+                        for idx, seat in enumerate(vacant_seats[:20], 1):
+                            res += f"{idx}. 📌 {seat}\n"
+                        res += "\n"
+                    else:
+                        res += f"⚠️ Coach {c_name} में कोई खाली सीट नहीं मिली।\n\n"
 
             return res
 
         except Exception as e:
-            return f"❌ Connection Error: {str(e)}"
+            return f"❌ API Connection Error: {str(e)}"
 
 async def receive_coach_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.message.chat_id
@@ -173,7 +181,7 @@ async def receive_coach_input(update: Update, context: ContextTypes.DEFAULT_TYPE
     user_data_store[chat_id]['coach'] = coach_choice
     t_info = user_data_store[chat_id]
 
-    status_msg = await update.message.reply_text("⚡ Fast API से डेटा निकाला जा रहा है...")
+    status_msg = await update.message.reply_text("⚡ Fast API से डेटा फ़ेच किया जा रहा है...")
 
     result = await fetch_chart_api(t_info['train_no'], t_info['date'], t_info['station'], coach_choice)
     await status_msg.edit_text(result)
@@ -199,8 +207,10 @@ def main():
     )
 
     app.add_handler(conv_handler)
-    print("🚀 API Bot Ready!")
-    app.run_polling()
+    print("🚀 API Bot Active with Anti-Conflict Polling!")
+    
+    # drop_pending_updates prevents Telegram Conflict Error on Render deploys
+    app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
     main()
