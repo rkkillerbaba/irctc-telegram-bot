@@ -1,41 +1,20 @@
 import os
-import asyncio
-from http.server import HTTPServer, BaseHTTPRequestHandler
-import threading
 import httpx
-from telegram import Update
-from telegram.ext import (
-    ApplicationBuilder,
-    CommandHandler,
-    ContextTypes,
-    ConversationHandler,
-    MessageHandler,
-    filters,
-)
+import uvicorn
+from fastapi import FastAPI
+from fastapi.responses import HTMLResponse
+from pydantic import BaseModel
 
-# --- Dummy Web Server for Render Health Check ---
-class DummyServer(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b"IRCTC Bot is Active and Healthy!")
+app = FastAPI()
 
-    def do_HEAD(self):
-        self.send_response(200)
-        self.end_headers()
+# --- Request Model ---
+class ChartRequest(BaseModel):
+    train_no: str
+    date: str
+    station: str
+    coach: str
 
-def start_dummy_server():
-    port = int(os.environ.get("PORT", 10000))
-    server = HTTPServer(('0.0.0.0', port), DummyServer)
-    server.serve_forever()
-
-threading.Thread(target=start_dummy_server, daemon=True).start()
-
-# --- Conversation States ---
-TRAIN_NO, DATE, STATION, COACH_INPUT = range(4)
-user_data_store = {}
-
-# 🔥 Exact headers from your screenshot (No cookies needed!)
+# --- IRCTC Headers (Bypass) ---
 HEADERS = {
     "Host": "www.irctc.co.in",
     "Accept": "*/*",
@@ -48,27 +27,7 @@ HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 }
 
-# --- Handlers ---
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("👋 IRCTC Superfast Chart Bot में आपका स्वागत है!\n\nTrain Number दर्ज करें (उदा. 12191):")
-    return TRAIN_NO
-
-async def receive_train_no(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_data_store[update.message.chat_id] = {'train_no': update.message.text.strip()}
-    await update.message.reply_text("🗓️ Journey Date दर्ज करें (YYYY-MM-DD, उदा. 2026-07-31):")
-    return DATE
-
-async def receive_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_data_store[update.message.chat_id]['date'] = update.message.text.strip()
-    await update.message.reply_text("🚉 Boarding Station Code दर्ज करें (उदा. SRID, MML, NZM):")
-    return STATION
-
-async def receive_station(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.message.chat_id
-    user_data_store[chat_id]['station'] = update.message.text.strip().upper()
-    await update.message.reply_text("🚃 किस Coach की खाली सीटें देखना चाहते हैं?\nउदा. S6, B2, A1 या ALL दर्ज करें:")
-    return COACH_INPUT
-
+# --- Core Scraping Logic ---
 def parse_coach_json(json_data):
     berth_type_map = {'L': 'Lower', 'M': 'Middle', 'U': 'Upper', 'R': 'Side Lower', 'P': 'Side Upper', 'SL': 'Side Lower', 'SU': 'Side Upper'}
     vacant_list = []
@@ -90,16 +49,10 @@ def parse_coach_json(json_data):
     return vacant_list
 
 async def fetch_chart_api(train_no, date, station, coach_input):
-    # http2=False forces HTTP/1.1 to bypass the HTTP/2 stream error
     async with httpx.AsyncClient(http2=False, verify=False, timeout=30.0) as client:
         try:
-            # Directly hitting the API (No warm-up / no cookies!)
             comp_url = "https://www.irctc.co.in/online-charts/api/trainComposition"
-            payload = {
-                "trainNo": train_no,
-                "jDate": date,
-                "boardStn": station
-            }
+            payload = {"trainNo": train_no, "jDate": date, "boardStn": station}
             
             resp = await client.post(comp_url, json=payload, headers=HEADERS)
             if resp.status_code != 200:
@@ -109,15 +62,13 @@ async def fetch_chart_api(train_no, date, station, coach_input):
             coaches = comp_data.get("cdd", [])
             target_coach = coach_input.strip().upper()
 
-            res = f"🚆 RESERVATION CHART STATUS 🚆\n"
-            res += f"Train: {train_no} | Date: {date} | Boarding: {station}\n"
-            res += "───────────────────────────\n\n"
+            res = f"<h3>🚆 Train: {train_no} | Date: {date} | Boarding: {station}</h3><hr>"
 
             if coaches:
-                res += "📊 Coaches Overview:\n"
+                res += "<b>📊 Coaches Overview:</b><ul>"
                 for c in coaches[:15]:
-                    res += f"  • {c.get('coachName')} ({c.get('classCode')}): {c.get('vacantBerths')} Vacant\n"
-                res += "\n"
+                    res += f"<li>{c.get('coachName')} ({c.get('classCode')}): {c.get('vacantBerths')} Vacant</li>"
+                res += "</ul><br>"
 
             coaches_to_fetch = []
             if target_coach == "ALL":
@@ -130,68 +81,123 @@ async def fetch_chart_api(train_no, date, station, coach_input):
             coach_url = "https://www.irctc.co.in/online-charts/api/coachComposition"
             
             for c_name in coaches_to_fetch:
-                coach_payload = {
-                    "trainNo": train_no,
-                    "jDate": date,
-                    "boardStn": station,
-                    "coachName": c_name
-                }
-
+                coach_payload = {"trainNo": train_no, "jDate": date, "boardStn": station, "coachName": c_name}
                 coach_resp = await client.post(coach_url, json=coach_payload, headers=HEADERS)
+                
                 if coach_resp.status_code == 200:
                     coach_json = coach_resp.json()
                     vacant_seats = parse_coach_json(coach_json)
 
                     if vacant_seats:
-                        res += f"💺 Vacant Seats in Coach {c_name}:\n"
-                        for idx, seat in enumerate(vacant_seats[:30], 1):
-                            res += f"{idx}. 📌 {seat}\n"
-                        res += "\n"
+                        res += f"<b>💺 Vacant Seats in Coach {c_name}:</b><ul>"
+                        for seat in vacant_seats[:30]:
+                            res += f"<li>📌 {seat}</li>"
+                        res += "</ul><br>"
                     else:
-                        res += f"⚠️ Coach {c_name} में कोई खाली सीट नहीं मिली।\n\n"
+                        res += f"⚠️ Coach {c_name} में कोई खाली सीट नहीं मिली।<br><br>"
 
             return res
 
-        except httpx.ReadTimeout:
-            return "❌ Timeout Error: IRCTC सर्वर धीमा चल रहा है। कृपया कुछ देर बाद प्रयास करें।"
         except Exception as e:
             return f"❌ Connection Error: {str(e)}"
 
-async def receive_coach_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.message.chat_id
-    coach_choice = update.message.text.strip()
-    user_data_store[chat_id]['coach'] = coach_choice
-    t_info = user_data_store[chat_id]
+# --- Web Endpoints ---
+@app.post("/api/get_chart")
+async def get_chart(req: ChartRequest):
+    result = await fetch_chart_api(req.train_no, req.date, req.station, req.coach)
+    return {"html_result": result}
 
-    status_msg = await update.message.reply_text("⚡ IRCTC API से डेटा निकाला जा रहा है...")
+@app.get("/", response_class=HTMLResponse)
+async def serve_gui():
+    # Modern HTML + CSS (Tailwind) + JS GUI
+    html_content = """
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>IRCTC Fast Chart API</title>
+        <script src="https://cdn.tailwindcss.com"></script>
+        <style>
+            body { background-color: #f3f4f6; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; }
+            .loader { border: 4px solid #f3f3f3; border-top: 4px solid #3498db; border-radius: 50%; width: 30px; height: 30px; animation: spin 1s linear infinite; display: none; margin: auto;}
+            @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+        </style>
+    </head>
+    <body class="flex items-center justify-center min-h-screen p-4">
+        <div class="bg-white p-8 rounded-xl shadow-lg w-full max-w-md">
+            <h1 class="text-2xl font-bold text-center text-blue-600 mb-6">🚆 IRCTC Chart Finder</h1>
+            
+            <form id="chartForm" class="space-y-4">
+                <div>
+                    <label class="block text-sm font-medium text-gray-700">Train Number</label>
+                    <input type="text" id="train_no" placeholder="e.g. 12191" required class="mt-1 w-full px-4 py-2 border rounded-md focus:ring-blue-500 focus:border-blue-500">
+                </div>
+                <div>
+                    <label class="block text-sm font-medium text-gray-700">Journey Date</label>
+                    <input type="date" id="date" required class="mt-1 w-full px-4 py-2 border rounded-md focus:ring-blue-500 focus:border-blue-500">
+                </div>
+                <div>
+                    <label class="block text-sm font-medium text-gray-700">Boarding Station</label>
+                    <input type="text" id="station" placeholder="e.g. SRID, MML" required class="mt-1 w-full px-4 py-2 border rounded-md focus:ring-blue-500 focus:border-blue-500">
+                </div>
+                <div>
+                    <label class="block text-sm font-medium text-gray-700">Coach (or ALL)</label>
+                    <input type="text" id="coach" placeholder="e.g. S6, B2, ALL" required class="mt-1 w-full px-4 py-2 border rounded-md focus:ring-blue-500 focus:border-blue-500">
+                </div>
+                
+                <button type="submit" class="w-full bg-blue-600 text-white font-bold py-2 px-4 rounded hover:bg-blue-700 transition">
+                    Check Chart
+                </button>
+            </form>
 
-    result = await fetch_chart_api(t_info['train_no'], t_info['date'], t_info['station'], coach_choice)
-    await status_msg.edit_text(result)
-    return ConversationHandler.END
+            <div id="loader" class="loader mt-6"></div>
+            
+            <div id="resultBox" class="mt-6 p-4 bg-gray-50 border rounded-md hidden max-h-96 overflow-y-auto text-sm text-gray-800">
+                <!-- Results will appear here -->
+            </div>
+        </div>
 
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("❌ प्रक्रिया रद्द कर दी गई।")
-    return ConversationHandler.END
+        <script>
+            document.getElementById('chartForm').addEventListener('submit', async (e) => {
+                e.preventDefault();
+                
+                const resultBox = document.getElementById('resultBox');
+                const loader = document.getElementById('loader');
+                
+                // Show loader, hide old result
+                loader.style.display = 'block';
+                resultBox.classList.add('hidden');
+                
+                const payload = {
+                    train_no: document.getElementById('train_no').value,
+                    date: document.getElementById('date').value,
+                    station: document.getElementById('station').value.toUpperCase(),
+                    coach: document.getElementById('coach').value.toUpperCase()
+                };
 
-def main():
-    BOT_TOKEN = os.getenv("BOT_TOKEN")
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
-
-    conv_handler = ConversationHandler(
-        entry_points=[CommandHandler("start", start)],
-        states={
-            TRAIN_NO: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_train_no)],
-            DATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_date)],
-            STATION: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_station)],
-            COACH_INPUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_coach_input)],
-        },
-        fallbacks=[CommandHandler("cancel", cancel)],
-    )
-
-    app.add_handler(conv_handler)
-    print("🚀 Bot Active - HTTP/1.1 No-Cookie API Bypass!")
-    
-    app.run_polling(drop_pending_updates=True)
+                try {
+                    const response = await fetch('/api/get_chart', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(payload)
+                    });
+                    
+                    const data = await response.json();
+                    resultBox.innerHTML = data.html_result;
+                } catch (error) {
+                    resultBox.innerHTML = '<span class="text-red-500">❌ Error connecting to server!</span>';
+                } finally {
+                    loader.style.display = 'none';
+                    resultBox.classList.remove('hidden');
+                }
+            });
+        </script>
+    </body>
+    </html>
+    """
+    return html_content
 
 if __name__ == "__main__":
-    main()
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
