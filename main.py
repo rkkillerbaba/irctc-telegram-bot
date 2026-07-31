@@ -14,13 +14,13 @@ from telegram.ext import (
 )
 from playwright.async_api import async_playwright
 
-# --- Dummy Server for Render Free Service ---
+# --- Dummy Server for Render ---
 class DummyServer(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.send_header("Content-type", "text/html")
         self.end_headers()
-        self.wfile.write(b"Bot is active!")
+        self.wfile.write(b"Bot Active")
 
     def do_HEAD(self):
         self.send_response(200)
@@ -30,18 +30,16 @@ class DummyServer(BaseHTTPRequestHandler):
 def start_dummy_server():
     port = int(os.environ.get("PORT", 10000))
     server = HTTPServer(('0.0.0.0', port), DummyServer)
-    print(f"🌐 Server running on port {port}")
     server.serve_forever()
 
 threading.Thread(target=start_dummy_server, daemon=True).start()
 
-# --- Auto Install Chromium ---
 def ensure_playwright_browsers():
     os.system("playwright install chromium")
 
 ensure_playwright_browsers()
 
-# --- Bot States ---
+# --- Bot Conversation States ---
 TRAIN_NO, DATE, STATION, COACH_INPUT = range(4)
 user_data_store = {}
 
@@ -72,7 +70,7 @@ async def receive_station(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     return COACH_INPUT
 
-# --- Accurate Autocomplete Handled Scraping ---
+# --- Optimized Fast Scraping Logic ---
 async def fetch_chart_data(train_no: str, date: str, station: str, coach_input: str):
     async with async_playwright() as p:
         try:
@@ -83,51 +81,59 @@ async def fetch_chart_data(train_no: str, date: str, station: str, coach_input: 
                     "--disable-setuid-sandbox",
                     "--disable-dev-shm-usage",
                     "--disable-http2",
+                    "--blink-settings=imagesEnabled=false",
                 ]
             )
+            # Custom Context to Bypass Cloudflare/Bot detection
             context = await browser.new_context(
                 user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-                viewport={"width": 1280, "height": 800}
+                viewport={"width": 1366, "height": 768}
             )
             page = await context.new_page()
 
-            # Open IRCTC Page
-            await page.goto("https://www.irctc.co.in/online-charts/", timeout=40000, wait_until="domcontentloaded")
+            # Abort heavy assets to speed up connection
+            await page.route("**/*.{png,jpg,jpeg,svg,css,woff,woff2}", lambda route: route.abort())
+
+            # 1. Open IRCTC Page (Fast Load Mode)
+            await page.goto("https://www.irctc.co.in/online-charts/", timeout=30000, wait_until="commit")
             await page.wait_for_timeout(2000)
 
-            # 1. Fill Train Number and Click Dropdown Pop-up
+            # 2. Fill Train Number using Keyboard Actions
             train_input = page.locator("input[placeholder*='Train']")
+            await train_input.click()
             await train_input.fill(train_no)
             await page.wait_for_timeout(1500)
             
-            # Autocomplete Option Click (e.g. "22188 - INTERCITY EXP")
-            await page.locator("mat-option, .mat-autocomplete-panel option, div[role='option']").first.click()
+            # Use Keyboard ArrowDown & Enter to select Autocomplete option reliably
+            await page.keyboard.press("ArrowDown")
+            await page.keyboard.press("Enter")
             await page.wait_for_timeout(1000)
 
-            # 2. Fill Boarding Station and Click Dropdown Pop-up
+            # 3. Fill Station Code
             stn_input = page.locator("input[placeholder*='Boarding'], input[placeholder*='Station']")
             if await stn_input.count() > 0:
+                await stn_input.click()
                 await stn_input.fill(station)
                 await page.wait_for_timeout(1500)
-                # Autocomplete Option Click (e.g. "MADAN MAHAL (MML)")
-                await page.locator("mat-option, .mat-autocomplete-panel option, div[role='option']").first.click()
+                await page.keyboard.press("ArrowDown")
+                await page.keyboard.press("Enter")
                 await page.wait_for_timeout(1000)
 
-            # 3. Click GET TRAIN CHART Button
+            # 4. Click Submit
             get_chart_btn = page.locator("button:has-text('GET TRAIN CHART')")
             await get_chart_btn.click()
             await page.wait_for_timeout(4000)
 
-            # 4. Click First Class Button (Page 2)
+            # 5. Click First Class Option Button
             class_buttons = await page.query_selector_all("button")
             for btn in class_buttons:
                 txt = await btn.inner_text()
                 if any(c in txt for c in ["SITTING", "AC", "CHAIR", "SLEEPER", "2S", "3A", "CC"]):
                     await btn.click()
-                    await page.wait_for_timeout(4000)
+                    await page.wait_for_timeout(3000)
                     break
 
-            # 5. Extract Vacant Berth Table (Page 3)
+            # 6. Extract Table Details
             rows = await page.query_selector_all("tr")
             target_coach = coach_input.strip().upper()
             vacant_seats = []
@@ -154,18 +160,18 @@ async def fetch_chart_data(train_no: str, date: str, station: str, coach_input: 
             res += "───────────────────────────\n\n"
 
             if vacant_seats:
-                res += "💺 Vacant Berth Details (Seat Number Wise):\n\n"
+                res += "💺 Vacant Berth Details:\n\n"
                 for idx, seat in enumerate(vacant_seats[:35], 1):
                     res += f"{idx}. 📌 {seat}\n"
             else:
-                res += f"⚠️ Coach '{target_coach}' में कोई खाली सीट नहीं मिली या डेटा लोड नहीं हो पाया।"
+                res += f"⚠️ Coach '{target_coach}' में कोई खाली सीट नहीं मिली या चार्ट लोड नहीं हो सका।"
 
             return res
 
         except Exception as e:
-            return f"❌ Error: {str(e)}"
+            return f"❌ Scraping Error: {str(e)}"
 
-# --- Step 5: Process Coach and Send Result ---
+# --- Process Coach Input ---
 async def receive_coach_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.message.chat_id
     coach_choice = update.message.text.strip()
@@ -174,7 +180,7 @@ async def receive_coach_input(update: Update, context: ContextTypes.DEFAULT_TYPE
     t_info = user_data_store[chat_id]
     
     status_msg = await update.message.reply_text(
-        f"⏳ IRCTC Chart से Coach '{coach_choice.upper()}' का डेटा निकाला जा रहा है...\nकृपया 5-8 सेकंड प्रतीक्षा करें..."
+        f"⏳ IRCTC से Coach '{coach_choice.upper()}' की जानकारी निकाली जा रही है...\nकृपया 5-8 सेकंड प्रतीक्षा करें..."
     )
 
     result = await fetch_chart_data(t_info['train_no'], t_info['date'], t_info['station'], coach_choice)
@@ -202,7 +208,7 @@ def main():
     )
 
     app.add_handler(conv_handler)
-    print("🤖 Bot Active with AutoComplete Fix...")
+    print("🤖 Bot Active with Keyboard Autocomplete Navigation...")
     app.run_polling()
 
 if __name__ == "__main__":
