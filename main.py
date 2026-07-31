@@ -1,5 +1,7 @@
 import os
 import asyncio
+from http.server import HTTPServer, BaseHTTPRequestHandler
+import threading
 from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove
 from telegram.ext import (
     ApplicationBuilder,
@@ -11,7 +13,24 @@ from telegram.ext import (
 )
 from playwright.async_api import async_playwright
 
-# States
+# --- Dummy HTTP Server for Render Free Web Service ---
+class DummyServer(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-type", "text/html")
+        self.end_headers()
+        self.wfile.write(b"Bot is active and running!")
+
+def start_dummy_server():
+    port = int(os.environ.get("PORT", 10000))
+    server = HTTPServer(('0.0.0.0', port), DummyServer)
+    print(f"🌐 Dummy Web Server listening on port {port}")
+    server.serve_forever()
+
+# Background में Dummy Server चालू करें
+threading.Thread(target=start_dummy_server, daemon=True).start()
+
+# --- Telegram Bot Logic ---
 TRAIN_NO, DATE, STATION, COACH_CHOICE = range(4)
 user_data_store = {}
 
@@ -110,7 +129,6 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 def main():
-    # Render env variable से token उठाएगा
     BOT_TOKEN = os.getenv("BOT_TOKEN")
 
     app = ApplicationBuilder().token(BOT_TOKEN).build()
@@ -127,7 +145,7 @@ def main():
     )
 
     app.add_handler(conv_handler)
-    print("🤖 Bot Active...")
+    print("🤖 Bot Active with Free Web Service Port Binding...")
     app.run_polling()
 
 if __name__ == "__main__":
