@@ -1,8 +1,8 @@
 import os
 import asyncio
-import sys
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import threading
+import httpx
 from telegram import Update, ReplyKeyboardRemove
 from telegram.ext import (
     ApplicationBuilder,
@@ -12,19 +12,16 @@ from telegram.ext import (
     MessageHandler,
     filters,
 )
-from playwright.async_api import async_playwright
 
-# --- Dummy Server for Render ---
+# --- Dummy Web Server for Render ---
 class DummyServer(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
-        self.send_header("Content-type", "text/html")
         self.end_headers()
-        self.wfile.write(b"Bot Active")
+        self.wfile.write(b"Bot Running!")
 
     def do_HEAD(self):
         self.send_response(200)
-        self.send_header("Content-type", "text/html")
         self.end_headers()
 
 def start_dummy_server():
@@ -34,156 +31,128 @@ def start_dummy_server():
 
 threading.Thread(target=start_dummy_server, daemon=True).start()
 
-def ensure_playwright_browsers():
-    os.system("playwright install chromium")
-
-ensure_playwright_browsers()
-
-# --- Bot Conversation States ---
+# --- Conversation States ---
 TRAIN_NO, DATE, STATION, COACH_INPUT = range(4)
 user_data_store = {}
 
+# Common Headers to mimic Real Browser
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+    "Accept": "application/json, text/plain, */*",
+    "Content-Type": "application/json",
+    "Origin": "https://reservationchart.online",
+    "Referer": "https://reservationchart.online/",
+    "bmirak": "webbm"
+}
+
+# --- Step Handlers ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "👋 IRCTC Reservation Chart Bot में आपका स्वागत है!\n\n"
-        "कृपया Train Number दर्ज करें (उदा. 22188):"
-    )
+    await update.message.reply_text("👋 IRCTC Fast Chart Bot में आपका स्वागत है!\n\nTrain Number दर्ज करें (उदा. 22188):")
     return TRAIN_NO
 
 async def receive_train_no(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_data_store[update.message.chat_id] = {'train_no': update.message.text.strip()}
-    await update.message.reply_text("🗓️ अब Journey Date दर्ज करें (Format: YYYY-MM-DD, उदा. 2026-07-31):")
+    await update.message.reply_text("🗓️ Journey Date दर्ज करें (YYYY-MM-DD, उदा. 2026-07-31):")
     return DATE
 
 async def receive_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_data_store[update.message.chat_id]['date'] = update.message.text.strip()
-    await update.message.reply_text("🚉 अब Boarding Station Code दर्ज करें (उदा. MML, NDLS):")
+    await update.message.reply_text("🚉 Boarding Station Code दर्ज करें (उदा. ADTL, MML):")
     return STATION
 
 async def receive_station(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.message.chat_id
     user_data_store[chat_id]['station'] = update.message.text.strip().upper()
 
-    await update.message.reply_text(
-        "🚃 किस Coach की सीटें देखना चाहते हैं?\n"
-        "उदा. D9, D8, B1, C1 या सभी के लिए ALL लिखें:"
-    )
+    await update.message.reply_text("🚃 किस Coach की खाली सीटें देखना चाहते हैं?\nउदा. B2, D9, B1 या ALL दर्ज करें:")
     return COACH_INPUT
 
-# --- Optimized Fast Scraping Logic ---
-async def fetch_chart_data(train_no: str, date: str, station: str, coach_input: str):
-    async with async_playwright() as p:
+# --- Direct API Fetcher Logic ---
+async def parse_coach_json(json_data, target_coach):
+    berth_type_map = {'L': 'Lower', 'M': 'Middle', 'U': 'Upper', 'R': 'Side Lower', 'P': 'Side Upper'}
+    vacant_list = []
+
+    for berth in json_data.get('bdd', []):
+        berth_no = berth.get('berthNo')
+        berth_code = berth_type_map.get(berth.get('berthCode'), berth.get('berthCode'))
+        
+        # Segment Analysis (Free vs Occupied)
+        for seg in berth.get('bsd', []):
+            if not seg.get('occupancy'): # If occupancy is False -> Seat Available!
+                from_stn = seg.get('from')
+                to_stn = seg.get('to')
+                quota = seg.get('quota', 'GN')
+                vacant_list.append(f"Berth {berth_no} ({berth_code}) | {from_stn} ➔ {to_stn} [Quota: {quota}]")
+
+    return vacant_list
+
+async def fetch_chart_api(train_no, date, station, coach_input):
+    async with httpx.AsyncClient(headers=HEADERS, timeout=15.0, follow_redirects=True) as client:
         try:
-            browser = await p.chromium.launch(
-                headless=True,
-                args=[
-                    "--no-sandbox",
-                    "--disable-setuid-sandbox",
-                    "--disable-dev-shm-usage",
-                    "--disable-http2",
-                    "--blink-settings=imagesEnabled=false",
-                ]
-            )
-            # Custom Context to Bypass Cloudflare/Bot detection
-            context = await browser.new_context(
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-                viewport={"width": 1366, "height": 768}
-            )
-            page = await context.new_page()
-
-            # Abort heavy assets to speed up connection
-            await page.route("**/*.{png,jpg,jpeg,svg,css,woff,woff2}", lambda route: route.abort())
-
-            # 1. Open IRCTC Page (Fast Load Mode)
-            await page.goto("https://www.irctc.co.in/online-charts/", timeout=30000, wait_until="commit")
-            await page.wait_for_timeout(2000)
-
-            # 2. Fill Train Number using Keyboard Actions
-            train_input = page.locator("input[placeholder*='Train']")
-            await train_input.click()
-            await train_input.fill(train_no)
-            await page.wait_for_timeout(1500)
+            # 1. Fetch Train Composition (Summary)
+            comp_url = "https://www.irctc.co.in/online-charts/api/trainComposition"
+            payload = {
+                "trainNo": train_no,
+                "jDate": date,
+                "boardStn": station
+            }
             
-            # Use Keyboard ArrowDown & Enter to select Autocomplete option reliably
-            await page.keyboard.press("ArrowDown")
-            await page.keyboard.press("Enter")
-            await page.wait_for_timeout(1000)
+            resp = await client.post(comp_url, json=payload)
+            if resp.status_code != 200:
+                return f"❌ IRCTC API Error ({resp.status_code}): चार्ट उपलब्ध नहीं है या स्टेशन/डेट गलत है।"
 
-            # 3. Fill Station Code
-            stn_input = page.locator("input[placeholder*='Boarding'], input[placeholder*='Station']")
-            if await stn_input.count() > 0:
-                await stn_input.click()
-                await stn_input.fill(station)
-                await page.wait_for_timeout(1500)
-                await page.keyboard.press("ArrowDown")
-                await page.keyboard.press("Enter")
-                await page.wait_for_timeout(1000)
+            comp_data = resp.json()
+            coaches = comp_data.get("cdd", [])
 
-            # 4. Click Submit
-            get_chart_btn = page.locator("button:has-text('GET TRAIN CHART')")
-            await get_chart_btn.click()
-            await page.wait_for_timeout(4000)
-
-            # 5. Click First Class Option Button
-            class_buttons = await page.query_selector_all("button")
-            for btn in class_buttons:
-                txt = await btn.inner_text()
-                if any(c in txt for c in ["SITTING", "AC", "CHAIR", "SLEEPER", "2S", "3A", "CC"]):
-                    await btn.click()
-                    await page.wait_for_timeout(3000)
-                    break
-
-            # 6. Extract Table Details
-            rows = await page.query_selector_all("tr")
+            # Filter Target Coaches
             target_coach = coach_input.strip().upper()
-            vacant_seats = []
 
-            for row in rows:
-                cols = await row.query_selector_all("td")
-                if len(cols) >= 4:
-                    from_stn = (await cols[0].inner_text()).strip()
-                    to_stn = (await cols[1].inner_text()).strip()
-                    coach = (await cols[2].inner_text()).strip()
-                    berth = (await cols[3].inner_text()).strip()
+            # 2. Fetch Specific Coach Details if requested
+            coach_url = "https://www.irctc.co.in/online-charts/api/coachComposition"
+            coach_payload = {
+                "trainNo": train_no,
+                "jDate": date,
+                "boardStn": station,
+                "coachName": target_coach if target_coach != "ALL" else (coaches[0]['coachName'] if coaches else "B1")
+            }
 
-                    if target_coach != "ALL" and target_coach != coach.upper():
-                        continue
-
-                    vacant_seats.append(f"From: {from_stn} ➔ To: {to_stn} | Coach: {coach} | Berth No: {berth}")
-
-            await browser.close()
-
-            # Format Response
+            coach_resp = await client.post(coach_url, json=coach_payload)
+            
             res = f"🚆 RESERVATION CHART STATUS 🚆\n"
             res += f"Train: {train_no} | Date: {date} | Station: {station}\n"
-            res += f"Filter Coach: {target_coach}\n"
             res += "───────────────────────────\n\n"
 
-            if vacant_seats:
-                res += "💺 Vacant Berth Details:\n\n"
-                for idx, seat in enumerate(vacant_seats[:35], 1):
-                    res += f"{idx}. 📌 {seat}\n"
-            else:
-                res += f"⚠️ Coach '{target_coach}' में कोई खाली सीट नहीं मिली या चार्ट लोड नहीं हो सका।"
+            if coaches:
+                res += "📊 Coach Summary:\n"
+                for c in coaches:
+                    res += f"  • {c.get('coachName')} ({c.get('classCode')}): {c.get('vacantBerths')} Vacant\n"
+                res += "\n"
+
+            if coach_resp.status_code == 200:
+                coach_json = coach_resp.json()
+                vacant_seats = await parse_coach_json(coach_json, target_coach)
+
+                if vacant_seats:
+                    res += f"💺 Vacant Seats for Coach {target_coach}:\n\n"
+                    for idx, seat in enumerate(vacant_seats[:35], 1):
+                        res += f"{idx}. 📌 {seat}\n"
+                else:
+                    res += f"⚠️ Coach {target_coach} में कोई खाली सीट नहीं मिली।"
 
             return res
 
         except Exception as e:
-            return f"❌ Scraping Error: {str(e)}"
+            return f"❌ API Processing Error: {str(e)}"
 
-# --- Process Coach Input ---
 async def receive_coach_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.message.chat_id
     coach_choice = update.message.text.strip()
     user_data_store[chat_id]['coach'] = coach_choice
-
     t_info = user_data_store[chat_id]
-    
-    status_msg = await update.message.reply_text(
-        f"⏳ IRCTC से Coach '{coach_choice.upper()}' की जानकारी निकाली जा रही है...\nकृपया 5-8 सेकंड प्रतीक्षा करें..."
-    )
 
-    result = await fetch_chart_data(t_info['train_no'], t_info['date'], t_info['station'], coach_choice)
+    status_msg = await update.message.reply_text("⚡ Fast API से चार्ट डेटा निकाला जा रहा है...")
+
+    result = await fetch_chart_api(t_info['train_no'], t_info['date'], t_info['station'], coach_choice)
     await status_msg.edit_text(result)
     return ConversationHandler.END
 
@@ -193,7 +162,6 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def main():
     BOT_TOKEN = os.getenv("BOT_TOKEN")
-
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
     conv_handler = ConversationHandler(
@@ -208,7 +176,7 @@ def main():
     )
 
     app.add_handler(conv_handler)
-    print("🤖 Bot Active with Keyboard Autocomplete Navigation...")
+    print("🚀 Superfast API-based Bot Active!")
     app.run_polling()
 
 if __name__ == "__main__":
